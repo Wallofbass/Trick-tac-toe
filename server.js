@@ -1,110 +1,88 @@
 
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-
+const express = require("express");
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server);
+const http = require("http").createServer(app);
+const io = require("socket.io")(http);
+const path = require("path");
 
-app.use(express.static('public'));
+const PORT = process.env.PORT || 3000;
 
-let waitingPlayer = null;
-const rematchRequests = {};
-const roomPlayers = {}; // Tracks players per room
-const lastFirstPlayer = {}; // Tracks last starter to alternate turns
+app.use(express.static(path.join(__dirname, "public")));
 
-io.on('connection', socket => {
-  console.log('A player connected:', socket.id);
+const players = {};
+const ties = {};
 
-  if (waitingPlayer) {
-    const room = `room-${waitingPlayer.id}-${socket.id}`;
-    socket.join(room);
-    waitingPlayer.join(room);
+io.on("connection", (socket) => {
+  console.log("A user connected:", socket.id);
 
-    const symbols = {
-      [waitingPlayer.id]: 'X',
-      [socket.id]: 'O'
-    };
-
-    roomPlayers[room] = [waitingPlayer.id, socket.id];
-    lastFirstPlayer[room] = waitingPlayer.id;
-
-    io.to(room).emit('startGame', {
-      room,
-      players: roomPlayers[room],
-      symbols
-    });
-
-    rematchRequests[room] = new Set();
-    waitingPlayer = null;
-  } else {
-    waitingPlayer = socket;
-    socket.emit('waiting');
+  // Matchmaking
+  let opponent = null;
+  for (let id in players) {
+    if (!players[id].opponent) {
+      opponent = id;
+      break;
+    }
   }
 
-  socket.on('move', data => {
-    socket.to(data.room).emit('opponentMove', data);
-  });
+  players[socket.id] = {
+    opponent: opponent,
+    score: 0
+  };
 
-  socket.on('guess', data => {
-    socket.to(data.room).emit('opponentGuess', data);
-  });
+  if (opponent) {
+    players[opponent].opponent = socket.id;
+    ties[socket.id] = 0;
+    ties[opponent] = 0;
+    io.to(socket.id).emit("playerNumber", 2);
+    io.to(opponent).emit("playerNumber", 1);
+    io.to(socket.id).emit("message", "Game start! You are Player 2.");
+    io.to(opponent).emit("message", "Game start! You are Player 1.");
+    io.to(socket.id).emit("updateTies", ties[socket.id]);
+    io.to(opponent).emit("updateTies", ties[opponent]);
+  }
 
-  socket.on('turnComplete', data => {
-    socket.to(data.room).emit('turnComplete');
-  });
-
-  socket.on('rematchRequest', data => {
-    const room = data.room;
-    const clients = Array.from(io.sockets.adapter.rooms.get(room) || []);
-    if (!clients.includes(socket.id)) return;
-
-    rematchRequests[room] = rematchRequests[room] || new Set();
-    rematchRequests[room].add(socket.id);
-
-    if (rematchRequests[room].size === 2) {
-      const [player1, player2] = roomPlayers[room];
-      const previousStarter = lastFirstPlayer[room];
-      const nextStarter = previousStarter === player1 ? player2 : player1;
-      lastFirstPlayer[room] = nextStarter;
-
-      const symbols = {
-        [player1]: 'X',
-        [player2]: 'O'
-      };
-
-      io.to(room).emit('gameRestarted', {
-        room,
-        players: [player1, player2],
-        nextTurn: nextStarter,
-        symbols
-      });
-
-      rematchRequests[room].clear();
-    }
-  });
-
-  socket.on('disconnect', () => {
-    console.log('A player disconnected:', socket.id);
-
-    if (waitingPlayer === socket) {
-      waitingPlayer = null;
-    }
-
-    for (const room in rematchRequests) {
-      rematchRequests[room].delete(socket.id);
-      if (roomPlayers[room]) {
-        const otherPlayer = roomPlayers[room].find(id => id !== socket.id);
-        if (otherPlayer) {
-          io.to(otherPlayer).emit('opponentLeft');
-        }
-        delete roomPlayers[room];
+  socket.on("gameWon", () => {
+    if (players[socket.id]) {
+      players[socket.id].score++;
+      const playerScore = players[socket.id].score;
+      const opponentId = players[socket.id].opponent;
+      io.to(socket.id).emit("updateScore", playerScore);
+      if (opponentId) {
+        io.to(opponentId).emit("opponentScore", playerScore);
       }
     }
   });
+
+  socket.on("gameTied", () => {
+    const opponentId = players[socket.id]?.opponent;
+    if (opponentId) {
+      ties[socket.id]++;
+      ties[opponentId]++;
+      io.to(socket.id).emit("updateTies", ties[socket.id]);
+      io.to(opponentId).emit("updateTies", ties[opponentId]);
+    }
+  });
+
+  socket.on("restartGame", () => {
+    const opponentId = players[socket.id]?.opponent;
+    if (opponentId) {
+      io.to(socket.id).emit("restartGame");
+      io.to(opponentId).emit("restartGame");
+    }
+  });
+
+  socket.on("disconnect", () => {
+    const opponentId = players[socket.id]?.opponent;
+    if (opponentId && players[opponentId]) {
+      players[opponentId].opponent = null;
+      io.to(opponentId).emit("message", "Your opponent has disconnected.");
+    }
+    delete players[socket.id];
+    delete ties[socket.id];
+    console.log("User disconnected:", socket.id);
+  });
 });
 
-server.listen(3000, () => {
-  console.log('Server running on http://localhost:3000');
+http.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
